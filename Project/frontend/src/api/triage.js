@@ -9,7 +9,7 @@
  * All Ollama queries are LOCAL — no cloud API keys or internet required.
  */
 
-const API_BASE = 'https://roadsos-backend.onrender.com';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000';
 
 const OFFLINE_DICTIONARY = {
   bleed: {
@@ -97,10 +97,17 @@ export async function fetchTriage(description, profile = null) {
     });
 
     if (!response.ok) {
-      throw new Error(`Server error (${response.status})`);
+      console.warn(`[Triage] Server error (${response.status}) — using offline dictionary`);
+      return getOfflineFallback(description);
     }
 
-    return await response.json();
+    const data = await response.json();
+    if (!data?.steps || !Array.isArray(data.steps) || data.steps.length === 0) {
+      console.warn('[Triage] Malformed response — using offline dictionary');
+      return getOfflineFallback(description);
+    }
+
+    return data;
 
   } catch (err) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
@@ -111,7 +118,8 @@ export async function fetchTriage(description, profile = null) {
       console.warn('[Triage] Backend unreachable — using offline dictionary');
       return getOfflineFallback(description);
     }
-    throw err;
+    console.warn('[Triage] Unexpected error — using offline dictionary', err);
+    return getOfflineFallback(description);
   }
 }
 
@@ -127,17 +135,25 @@ export async function fetchTriage(description, profile = null) {
  * @returns {() => void} — cancel function (closes the EventSource)
  */
 export function streamTriage(description, profile, { onToken, onDone, onError }) {
-  const params = new URLSearchParams({ description });
+  const params = new URLSearchParams({ description, _t: Date.now().toString() });
   if (profile?.blood_type) params.set('blood_type', profile.blood_type);
-  if (profile?.allergies?.length) params.set('allergies', profile.allergies.join(','));
+  if (profile?.allergies) {
+    const allergies = Array.isArray(profile.allergies)
+      ? profile.allergies
+      : String(profile.allergies).split(',').map((item) => item.trim()).filter(Boolean);
+    if (allergies.length) params.set('allergies', allergies.join(','));
+  }
 
   const url = `${API_BASE}/triage/stream?${params.toString()}`;
+  console.log('[Triage Stream] Initiating connection to:', url);
 
   // EventSource only supports GET — perfect for our streaming endpoint
   let es;
   try {
     es = new EventSource(url);
+    es.onopen = () => console.log('[Triage Stream] EventSource CONNECTED');
   } catch (err) {
+    console.error('[Triage Stream] EventSource construction failed:', err);
     onError(new Error('SSE not supported in this browser'));
     onDone(getOfflineFallback(description));
     return () => {};
@@ -145,14 +161,21 @@ export function streamTriage(description, profile, { onToken, onDone, onError })
 
   const timeoutId = setTimeout(() => {
     es.close();
-    console.warn('[Triage Stream] Timed out — emitting offline dictionary');
-    onDone(getOfflineFallback(description));
-  }, 120_000);
+    console.warn('[Triage Stream] 15s Timed out — signalling onError');
+    onError(new Error('Triage request timed out'));
+  }, 15_000);
 
   es.onmessage = (event) => {
+    console.log('[Triage Stream] Received message. Length:', event.data?.length, 'Data:', event.data.substring(0, 100));
     try {
       const data = JSON.parse(event.data);
-      if (data.done) {
+      if (data.error) {
+        console.error('[Triage Stream] Backend sent explicit error:', data.message);
+        clearTimeout(timeoutId);
+        es.close();
+        onError(new Error(data.message || 'Backend AI stream failed'));
+      } else if (data.done) {
+        console.log('[Triage Stream] Stream complete (data.done). Steps:', data.steps?.length);
         clearTimeout(timeoutId);
         es.close();
         onDone({
@@ -164,39 +187,29 @@ export function streamTriage(description, profile, { onToken, onDone, onError })
           disclaimer: 'AEGIS AI first-aid guidance. Always seek immediate professional medical help.',
           latency_ms: 0,
         });
-      } else if (data.token) {
+      } else if (typeof data.token === 'string') {
+        console.log('[Triage Stream] Token received. Token length:', data.token.length);
         onToken(data.token);
+      } else {
+        console.warn('[Triage Stream] Unknown data format:', data);
       }
-    } catch {
-      // Malformed SSE frame — ignore and continue
+    } catch (e) {
+      console.error('[Triage Stream] JSON parse error:', e, 'Raw string:', event.data);
     }
   };
 
+  let errorHandled = false;
   es.onerror = (e) => {
+    console.error('[Triage Stream] SSE connection error (onerror triggered).', e);
+    if (errorHandled) return;
+    errorHandled = true;
     clearTimeout(timeoutId);
     es.close();
-    console.warn('[Triage Stream] SSE error / Offline detected — falling back to offline dictionary', e);
-    
-    // Simulate streaming the offline dictionary
-    const fallbackData = getOfflineFallback(description);
-    let currentStep = 0;
-    
-    const interval = setInterval(() => {
-      if (currentStep < fallbackData.steps.length) {
-        // Stream token by token (or step by step for simplicity)
-        const stepText = `${currentStep + 1}. ${fallbackData.steps[currentStep]}\n\n`;
-        onToken(stepText);
-        currentStep++;
-      } else {
-        clearInterval(interval);
-        onDone(fallbackData);
-      }
-    }, 400); // 400ms per step simulation
+    onError(new Error('EventSource failed'));
   };
 
   // Return cancel function
   return () => {
-    clearTimeout(timeoutId);
     es.close();
   };
 }

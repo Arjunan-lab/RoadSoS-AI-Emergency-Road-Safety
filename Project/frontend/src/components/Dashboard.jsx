@@ -7,10 +7,9 @@ import { streamTriage } from '../api/triage';
 import { fetchHospitals } from '../api/hospitals';
 import MedicalIDModal from './MedicalIDModal';
 
-// ─── Static Medical Matrix — Offline-First Fallback ─────────────────
-// Hardcoded medically-approved 3-step protocols. Works 100% offline.
+// Keys MUST match the label values passed from the injury buttons exactly.
 const OFFLINE_MEDICAL_MATRIX = {
-  BLEEDING: {
+  'SEVERE BLEEDING': {
     icon: 'drop', color: 'text-neon-crimson', border: 'border-neon-crimson', bg: 'bg-neon-crimson/10',
     steps: [
       'Apply direct, firm pressure to the wound using a clean cloth or bandage. Do NOT remove saturated cloth — add more on top.',
@@ -18,7 +17,7 @@ const OFFLINE_MEDICAL_MATRIX = {
       'Keep the victim still and warm. Call 112. Monitor breathing until paramedics arrive.',
     ],
   },
-  BURNS: {
+  'SEVERE BURNS': {
     icon: 'fire', color: 'text-orange-400', border: 'border-orange-400', bg: 'bg-orange-400/10',
     steps: [
       'Cool the burn immediately under cool (not cold) running water for 10–20 minutes.',
@@ -26,7 +25,7 @@ const OFFLINE_MEDICAL_MATRIX = {
       'Cover loosely with a clean, non-fluffy dressing or cling film. Call 112.',
     ],
   },
-  FRACTURE: {
+  'BONE FRACTURE': {
     icon: 'bone', color: 'text-neon-amber', border: 'border-neon-amber', bg: 'bg-neon-amber/10',
     steps: [
       'Keep the injured area completely still. Do NOT try to straighten the limb.',
@@ -34,20 +33,12 @@ const OFFLINE_MEDICAL_MATRIX = {
       'Apply a cold pack wrapped in cloth to reduce swelling. Call 112 immediately.',
     ],
   },
-  SHOCK: {
-    icon: 'heartbeat', color: 'text-neon-cyan', border: 'border-neon-cyan', bg: 'bg-neon-cyan/10',
+  'UNCONSCIOUS': {
+    icon: 'brain', color: 'text-neon-cyan', border: 'border-neon-cyan', bg: 'bg-neon-cyan/10',
     steps: [
-      'Lay the person flat on their back. Elevate their legs about 12 inches unless there is a head, neck, or back injury.',
-      'Keep them warm with a blanket. Loosen tight clothing around neck and chest.',
-      'Do NOT give food or water. Monitor breathing and pulse. Call 112 immediately.',
-    ],
-  },
-  CPR: {
-    icon: 'activity', color: 'text-bio-green', border: 'border-bio-green', bg: 'bg-bio-green/10',
-    steps: [
-      'Push hard and fast in the CENTER of the chest at 100–120 compressions/min (follow beat of “Stayin\u2019 Alive”).',
-      'Allow the chest to fully recoil between each compression. Ratio: 30 compressions → 2 rescue breaths.',
-      'Continue without interruption until the person breathes normally or paramedics arrive.',
+      'Check for responsiveness. Shout their name and tap shoulders firmly.',
+      'If no response and not breathing normally, begin CPR: 30 chest compressions then 2 rescue breaths.',
+      'Place in recovery position if breathing. Call 112 immediately and stay with them.',
     ],
   },
 };
@@ -207,7 +198,8 @@ export default function Dashboard() {
     console.log('[Dispatch] Attempting Twilio zero-touch dispatch to:', contact);
 
     try {
-      const res = await fetch('https://roadsos-backend.onrender.com/dispatch-whatsapp', {
+      const apiBase = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000';
+      const res = await fetch(`${apiBase}/dispatch-whatsapp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -503,32 +495,52 @@ export default function Dashboard() {
     setIsTriageLoading(true);
     setTriageStream('');
     setTriageSteps([]);
+    setIsOfflineMode(false);
 
     const profile = medicalId ? { blood_type: medicalId.bloodType, allergies: medicalId.allergies } : null;
     if (cancelStreamRef.current) cancelStreamRef.current();
 
-    // If already offline, skip fetch and go straight to matrix
+    // OFFLINE — use the local matrix immediately, no network call
     if (!navigator.onLine) {
       const matrix = OFFLINE_MEDICAL_MATRIX[injuryLabel];
       if (matrix) {
         setTriageSteps(matrix.steps);
         setIsTriageLoading(false);
         setIsOfflineMode(true);
-        return;
+      } else {
+        setTriageSteps([
+          'Keep the victim still and calm. Do not move them unless in immediate danger.',
+          'Check airway, breathing, and circulation (ABC). Apply pressure to any visible wounds.',
+          'Call 112 immediately. Stay with them and monitor until paramedics arrive.',
+        ]);
+        setIsTriageLoading(false);
+        setIsOfflineMode(true);
       }
+      return;
     }
 
+    // ONLINE — always call Gemini AI. The onerror handler falls back to local matrix if needed.
     const cancel = streamTriage(injuryLabel, profile, {
       onToken: (token) => setTriageStream((prev) => prev + token),
-      onDone:  (result) => {
+      onDone: (result) => {
         setTriageSteps(result.steps);
         setIsTriageLoading(false);
         setTriageStream('');
         cancelStreamRef.current = null;
-        // If the triage.js offline dictionary was used, flag offline mode
         if (result.source === 'offline-dictionary') setIsOfflineMode(true);
       },
       onError: () => {
+        // SSE hard-failed — fall back to correct local matrix entry
+        const matrix = OFFLINE_MEDICAL_MATRIX[injuryLabel];
+        if (matrix) {
+          setTriageSteps(matrix.steps);
+        } else {
+          setTriageSteps([
+            'Keep the victim still and calm. Do not move them unless in immediate danger.',
+            'Check airway, breathing, and circulation (ABC). Apply pressure to any visible wounds.',
+            'Call 112 immediately. Stay with them until paramedics arrive.',
+          ]);
+        }
         setIsOfflineMode(true);
         setIsTriageLoading(false);
       },
@@ -936,7 +948,7 @@ export default function Dashboard() {
                 <span className="font-tactical text-neon-cyan text-sm">AEGIS PROCESSING...</span>
               </div>
               <p className="font-mono text-white/50 text-xs">
-                {triageStream || 'Awaiting initial tokens from local model...'}
+                {triageStream.length > 50 ? 'Formulating response...' : triageStream.length > 10 ? 'Analyzing injury patterns...' : 'Connecting to Aegis AI (Gemini 2.5)...'}
                 <span className="animate-pulse text-neon-cyan inline-block w-2 h-4 bg-neon-cyan ml-1 align-middle"></span>
               </p>
             </div>
