@@ -1,0 +1,47 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "roadsos-api": {
+      "root": "Project/backend",
+      "framework": "fastapi"
+    },
+    "frontend": {
+      "root": "Project/frontend",
+      "framework": "vite",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "roadsos-api",
+          "format": "url",
+          "env": "ROADSOS_API_URL"
+        }
+      ]
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "roadsos-api"
+      }
+    },
+    {
+      "source": "/docs",
+      "destination": {
+        "service": "roadsos-api"
+      }
+    },
+    {
+      "source": "/openapi.json",
+      "destination": {
+        "service": "roadsos-api"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "frontend"
+      }
+    }
+  ]
+}
